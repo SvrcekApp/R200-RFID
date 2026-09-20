@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="../R200Example/R200Example.csproj" />
+  <Project Path="R200RFID.csproj" />
+</Solution>
