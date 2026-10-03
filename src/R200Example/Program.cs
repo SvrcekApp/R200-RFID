@@ -112,7 +112,9 @@ internal static class Program
             }
             catch (Exception exception) when (exception is ArgumentException or FormatException or IOException)
             {
-                Console.Error.WriteLine($"Operaci nelze provést: {exception.Message}\n");
+                Console.Error.WriteLine(
+                    $"Operaci nelze provést: {exception.GetType().FullName}, " +
+                    $"HRESULT=0x{exception.HResult:X8}\n{exception}\n");
             }
         }
     }

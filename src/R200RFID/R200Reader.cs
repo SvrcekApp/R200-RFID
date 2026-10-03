@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.IO.Ports;
 using System.Text;
 
@@ -232,12 +233,54 @@ public sealed class R200Reader : IDisposable, IAsyncDisposable
     /// <summary>Zastaví dříve spuštěnou operaci vícenásobného inventory.</summary>
     public async Task StopMultipleInventoryAsync(CancellationToken cancellationToken = default)
     {
-        var frame = await ExecuteCommandAsync(
-            (byte)R200Command.StopInventory,
-            ReadOnlyMemory<byte>.Empty,
-            [(byte)R200Command.StopInventory],
-            cancellationToken).ConfigureAwait(false);
-        EnsureStatus(frame, 0x00);
+        ThrowIfDisposed();
+        ValidateTimeout(CommandTimeout, nameof(CommandTimeout));
+        await _ioLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await WriteFrameCoreAsync(
+                (byte)R200Command.StopInventory,
+                ReadOnlyMemory<byte>.Empty,
+                cancellationToken).ConfigureAwait(false);
+
+            var started = Stopwatch.GetTimestamp();
+            while (true)
+            {
+                var remaining = CommandTimeout - Stopwatch.GetElapsedTime(started);
+                if (remaining <= TimeSpan.Zero)
+                {
+                    throw new TimeoutException($"No complete R200 frame was received within {CommandTimeout}.");
+                }
+
+                var frame = await ReadFrameCoreAsync(remaining, cancellationToken).ConfigureAwait(false);
+                if (frame.Type != R200FrameType.Response)
+                {
+                    continue;
+                }
+
+                if (frame.Command == (byte)R200Command.Error)
+                {
+                    var failure = ParseFailure(frame);
+                    if (failure.ErrorCode == 0x15)
+                    {
+                        // Modul může ještě odeslat výsledek posledního inventory cyklu bez tagu.
+                        continue;
+                    }
+
+                    throw new R200CommandException(failure);
+                }
+
+                if (frame.Command == (byte)R200Command.StopInventory)
+                {
+                    EnsureStatus(frame, 0x00);
+                    return;
+                }
+            }
+        }
+        finally
+        {
+            _ioLock.Release();
+        }
     }
 
     /// <summary>Zapíše úplný vektor Gen2 Select používaný k výběru jednoho nebo více tagů.</summary>
@@ -1123,6 +1166,14 @@ public sealed class R200Reader : IDisposable, IAsyncDisposable
 
     private async Task<R200Frame> ReadFrameCoreAsync(TimeSpan timeout, CancellationToken cancellationToken)
     {
+        if (_serialPort is not null)
+        {
+            return await ReadFrameFromSerialPortAsync(
+                _serialPort,
+                timeout,
+                cancellationToken).ConfigureAwait(false);
+        }
+
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCts.CancelAfter(timeout);
         try
@@ -1133,6 +1184,78 @@ public sealed class R200Reader : IDisposable, IAsyncDisposable
         {
             throw new TimeoutException($"No complete R200 frame was received within {timeout}.");
         }
+    }
+
+    private static async Task<R200Frame> ReadFrameFromSerialPortAsync(
+        SerialPort serialPort,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        if (!serialPort.IsOpen)
+        {
+            throw new InvalidOperationException("The serial port is not open. Call Open() first.");
+        }
+
+        const int pollingIntervalMilliseconds = 5;
+        var started = Stopwatch.GetTimestamp();
+
+        async ValueTask<byte> ReadByteAsync()
+        {
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var remaining = timeout - Stopwatch.GetElapsedTime(started);
+                if (remaining <= TimeSpan.Zero)
+                {
+                    throw new TimeoutException($"No complete R200 frame was received within {timeout}.");
+                }
+
+                if (serialPort.BytesToRead > 0)
+                {
+                    break;
+                }
+
+                var delay = remaining < TimeSpan.FromMilliseconds(pollingIntervalMilliseconds)
+                    ? remaining
+                    : TimeSpan.FromMilliseconds(pollingIntervalMilliseconds);
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            var value = serialPort.ReadByte();
+            if (value < 0)
+            {
+                throw new EndOfStreamException("The serial port closed before a complete R200 frame was received.");
+            }
+
+            return (byte)value;
+        }
+
+        byte header;
+        do
+        {
+            header = await ReadByteAsync().ConfigureAwait(false);
+        }
+        while (header != R200ProtocolCodec.FrameHeader);
+
+        var prefix = new byte[4];
+        for (var index = 0; index < prefix.Length; index++)
+        {
+            prefix[index] = await ReadByteAsync().ConfigureAwait(false);
+        }
+
+        var payloadLength = BinaryPrimitives.ReadUInt16BigEndian(prefix.AsSpan(2, 2));
+        var remainder = new byte[payloadLength + 2];
+        for (var index = 0; index < remainder.Length; index++)
+        {
+            remainder[index] = await ReadByteAsync().ConfigureAwait(false);
+        }
+
+        var complete = new byte[payloadLength + 7];
+        complete[0] = R200ProtocolCodec.FrameHeader;
+        prefix.CopyTo(complete, 1);
+        remainder.CopyTo(complete, 5);
+        return R200ProtocolCodec.ParseFrame(complete);
     }
 
     private static async Task<R200Frame> ReadFrameFromStreamAsync(Stream stream, CancellationToken cancellationToken)
